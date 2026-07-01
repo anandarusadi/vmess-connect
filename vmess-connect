@@ -43,23 +43,33 @@ def install_deps():
         if arch == "x86_64": goarch = "amd64"
         elif arch == "aarch64": goarch = "arm64"
         else: goarch = "amd64"
-        url = f"https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-{goarch}-v1.16.4.zip"
+        # Get latest release tag from GitHub API
+        try:
+            tag = subprocess.run(
+                ["curl", "-sL", "https://api.github.com/repos/xjasonlyu/tun2socks/releases/latest"],
+                capture_output=True, text=True, timeout=10)
+            import json as _json
+            latest = _json.loads(tag.stdout).get("tag_name", "v2.6.0")
+        except:
+            latest = "v2.6.0"
+        url = f"https://github.com/xjasonlyu/tun2socks/releases/download/{latest}/tun2socks-linux-{goarch}.zip"
         tmp = DIR / "tun2socks.zip"
-        subprocess.run(["curl", "-sL", "-o", str(tmp), url], check=True)
+        r = subprocess.run(["curl", "-sL", "-o", str(tmp), url], capture_output=True)
+        if r.returncode != 0 or tmp.stat().st_size < 1000:
+            # Fallback: try -v3 variant
+            url = f"https://github.com/xjasonlyu/tun2socks/releases/download/{latest}/tun2socks-linux-{goarch}-v3.zip"
+            subprocess.run(["curl", "-sL", "-o", str(tmp), url], check=True)
         subprocess.run(["unzip", "-o", str(tmp), "-d", str(DIR)], capture_output=True)
-        tun_bin = DIR / "tun2socks"
-        if tun_bin.exists():
-            os.chmod(tun_bin, 0o755)
-            subprocess.run(["sudo", "cp", str(tun_bin), "/usr/local/bin/tun2socks"], check=True)
-            log("[OK] tun2socks installed!", G)
+        # Find the binary inside extracted files
+        for f in DIR.glob("tun2socks*"):
+            if f.is_file() and not f.suffix == ".zip" and not f.name.endswith(".txt"):
+                os.chmod(f, 0o755)
+                subprocess.run(["sudo", "cp", str(f), "/usr/local/bin/tun2socks"], check=True)
+                log("[OK] tun2socks installed!", G)
+                break
         else:
-            # Try direct binary
-            for f in DIR.glob("tun2socks*"):
-                if f.is_file() and not f.suffix == ".zip":
-                    os.chmod(f, 0o755)
-                    subprocess.run(["sudo", "cp", str(f), "/usr/local/bin/tun2socks"], check=True)
-                    log("[OK] tun2socks installed!", G)
-                    break
+            log("[!] tun2socks install failed — TUN mode unavailable", Y)
+            log("    Proxy-only mode still works with -P flag", Y)
 
     log(f"\n{G}[OK] All deps installed! Ready to connect.{N}", G)
 
