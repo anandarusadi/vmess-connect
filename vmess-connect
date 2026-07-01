@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """VMess Connect — Kali Linux VMess/Xray tunnel tool (TUN mode like NetMod)"""
-import sys, os, json, base64, subprocess, signal, time, pathlib, re, struct
+import sys, os, json, base64, subprocess, signal, time, pathlib, re
 
 DIR = pathlib.Path.home() / ".vmess-connect"
 CONFIG = DIR / "config.json"
@@ -23,55 +23,73 @@ def setup():
     DIR.mkdir(parents=True, exist_ok=True)
     PROFILES.mkdir(parents=True, exist_ok=True)
 
+def run(cmd, **kw):
+    """Run command, return CompletedProcess"""
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
 def install_deps():
-    """Install xray + tun2socks"""
-    # Xray
-    if subprocess.run(["which", "xray"], capture_output=True).returncode == 0:
-        v = subprocess.run(["xray", "version"], capture_output=True, text=True).stdout.strip().split("\n")[0]
+    # --- Xray ---
+    if run(["which", "xray"]).returncode == 0:
+        v = run(["xray", "version"]).stdout.strip().split("\n")[0]
         log(f"[OK] Xray: {v}", G)
     else:
         log("[...] Installing Xray...", Y)
-        subprocess.run(['bash', '-c', 'bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install'], check=True)
-        log("[OK] Xray installed!", G)
-
-    # tun2socks
-    if subprocess.run(["which", "tun2socks"], capture_output=True).returncode == 0:
-        log("[OK] tun2socks: installed", G)
-    else:
-        log("[...] Installing tun2socks...", Y)
-        arch = os.uname().machine
-        if arch == "x86_64": goarch = "amd64"
-        elif arch == "aarch64": goarch = "arm64"
-        else: goarch = "amd64"
-        # Get latest release tag from GitHub API
-        try:
-            tag = subprocess.run(
-                ["curl", "-sL", "https://api.github.com/repos/xjasonlyu/tun2socks/releases/latest"],
-                capture_output=True, text=True, timeout=10)
-            import json as _json
-            latest = _json.loads(tag.stdout).get("tag_name", "v2.6.0")
-        except:
-            latest = "v2.6.0"
-        url = f"https://github.com/xjasonlyu/tun2socks/releases/download/{latest}/tun2socks-linux-{goarch}.zip"
-        tmp = DIR / "tun2socks.zip"
-        r = subprocess.run(["curl", "-sL", "-o", str(tmp), url], capture_output=True)
-        if r.returncode != 0 or tmp.stat().st_size < 1000:
-            # Fallback: try -v3 variant
-            url = f"https://github.com/xjasonlyu/tun2socks/releases/download/{latest}/tun2socks-linux-{goarch}-v3.zip"
-            subprocess.run(["curl", "-sL", "-o", str(tmp), url], check=True)
-        subprocess.run(["unzip", "-o", str(tmp), "-d", str(DIR)], capture_output=True)
-        # Find the binary inside extracted files
-        for f in DIR.glob("tun2socks*"):
-            if f.is_file() and not f.suffix == ".zip" and not f.name.endswith(".txt"):
-                os.chmod(f, 0o755)
-                subprocess.run(["sudo", "cp", str(f), "/usr/local/bin/tun2socks"], check=True)
-                log("[OK] tun2socks installed!", G)
-                break
+        r = subprocess.run(
+            ['bash', '-c', 'bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install'],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            log("[OK] Xray installed!", G)
         else:
-            log("[!] tun2socks install failed — TUN mode unavailable", Y)
-            log("    Proxy-only mode still works with -P flag", Y)
+            log("[X] Xray install failed!", R)
+            log(r.stderr[-300:] if r.stderr else r.stdout[-300:])
+            sys.exit(1)
 
-    log(f"\n{G}[OK] All deps installed! Ready to connect.{N}", G)
+    # --- tun2socks (optional) ---
+    if run(["which", "tun2socks"]).returncode == 0:
+        log("[OK] tun2socks: installed", G)
+        return
+
+    log("[...] Installing tun2socks (TUN mode)...", Y)
+    arch = os.uname().machine
+    goarch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch, "amd64")
+
+    # Try multiple URLs
+    urls = [
+        f"https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-linux-{goarch}-v3.zip",
+        f"https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-linux-{goarch}.zip",
+        f"https://github.com/xjasonlyu/tun2socks/releases/download/v2.5.1/tun2socks-linux-{goarch}-v3.zip",
+    ]
+
+    downloaded = False
+    tmp = DIR / "tun2socks.zip"
+    for url in urls:
+        log(f"  Trying: {url.split('/')[-1]}", C)
+        r = run(["curl", "-sL", "--max-time", "30", "-o", str(tmp), url])
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1000:
+            downloaded = True
+            break
+        log(f"  Failed (exit {r.returncode})", Y)
+
+    if not downloaded:
+        log("[!] tun2socks download failed — no TUN mode", Y)
+        log("    Proxy-only mode still works (SOCKS5 + HTTP)", Y)
+        log("    After connect run:", Y)
+        log("      export ALL_PROXY=socks5://127.0.0.1:10808", Y)
+        return
+
+    # Extract
+    run(["unzip", "-o", str(tmp), "-d", str(DIR)])
+
+    # Find binary
+    for f in DIR.glob("tun2socks*"):
+        if f.is_file() and f.suffix not in (".zip", ".txt") and "tun2socks" in f.name:
+            os.chmod(f, 0o755)
+            r = run(["sudo", "cp", str(f), "/usr/local/bin/tun2socks"])
+            if r.returncode == 0:
+                log("[OK] tun2socks installed!", G)
+                return
+
+    log("[!] tun2socks binary not found in zip", Y)
 
 def decode_vmess(link):
     b64 = link.replace("vmess://", "")
@@ -93,7 +111,7 @@ def generate_config(data):
     fp = data.get("fp", "")
     ps = data.get("ps", "vmess")
 
-    log(f"[→] {B}{ps}{N} | {addr}:{port} | {net} {tls} {sni}", C)
+    log(f"[->] {B}{ps}{N} | {addr}:{port} | {net} {tls} {sni}", C)
 
     stream = {"network": net}
     if tls == "tls":
@@ -141,59 +159,58 @@ def save_profile(link, data):
     log(f"[OK] Saved: {name}", G)
 
 def get_default_gw():
-    """Get current default gateway and interface before we change routing"""
-    r = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True)
-    # default via 172.31.16.1 dev eth0
+    r = run(["ip", "route", "show", "default"])
     parts = r.stdout.strip().split()
     try:
-        idx = parts.index("via")
-        gw = parts[idx + 1]
-        idx2 = parts.index("dev")
-        dev = parts[idx2 + 1]
+        gw = parts[parts.index("via") + 1]
+        dev = parts[parts.index("dev") + 1]
         return gw, dev
     except:
         return None, None
 
 def save_original_route():
-    """Save original default route so we can restore it"""
     gw, dev = get_default_gw()
     if gw and dev:
         (DIR / "orig_route").write_text(f"{gw} {dev}")
         log(f"[OK] Saved original route: {gw} via {dev}", C)
-    else:
-        log("[!] Could not detect default route", Y)
+
+def has_tun2socks():
+    return run(["which", "tun2socks"]).returncode == 0 or (DIR / "tun2socks").exists()
 
 def start_tun():
-    """Create TUN device and route all traffic through SOCKS proxy — like NetMod"""
+    if not has_tun2socks():
+        log("[!] tun2socks not installed — falling back to proxy-only", Y)
+        log("    Use: export ALL_PROXY=socks5://127.0.0.1:10808", Y)
+        return False
+
     save_original_route()
 
     # Create TUN device
-    subprocess.run(["sudo", "ip", "tuntap", "add", "mode", "tun", "name", TUN_DEV], capture_output=True)
-    subprocess.run(["sudo", "ip", "addr", "add", f"{TUN_IP}/24", "dev", TUN_DEV], capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", TUN_DEV, "up"], capture_output=True)
+    run(["sudo", "ip", "tuntap", "add", "mode", "tun", "name", TUN_DEV])
+    run(["sudo", "ip", "addr", "add", f"{TUN_IP}/24", "dev", TUN_DEV])
+    run(["sudo", "ip", "link", "set", TUN_DEV, "up"])
 
-    # Add route for proxy server via original gateway (so xray can reach server)
+    # Keep route to proxy server via original gateway
     if CONFIG.exists():
         try:
             cfg = json.loads(CONFIG.read_text())
             server_addr = cfg["outbounds"][0]["settings"]["vnext"][0]["address"]
             gw, dev = get_default_gw()
             if gw and dev and server_addr:
-                subprocess.run(["sudo", "ip", "route", "add", f"{server_addr}/32", "via", gw, "dev", dev], capture_output=True)
-                log(f"[OK] Route to server {server_addr} via {gw}", C)
+                run(["sudo", "ip", "route", "add", f"{server_addr}/32", "via", gw, "dev", dev])
+                log(f"[OK] Server route: {server_addr} via {gw}", C)
         except: pass
 
-    # Change default route to go through TUN
-    subprocess.run(["sudo", "ip", "route", "add", f"0.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV], capture_output=True)
-    subprocess.run(["sudo", "ip", "route", "add", f"128.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV], capture_output=True)
+    # Route all traffic through TUN
+    run(["sudo", "ip", "route", "add", "0.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV])
+    run(["sudo", "ip", "route", "add", "128.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV])
 
-    # Start tun2socks — bridges TUN device to SOCKS5 proxy
-    tun2socks_bin = "tun2socks"
-    if not subprocess.run(["which", tun2socks_bin], capture_output=True).returncode == 0:
-        tun2socks_bin = str(DIR / "tun2socks")
+    # Start tun2socks
+    tun_bin = "tun2socks" if run(["which", "tun2socks"]).returncode == 0 else str(DIR / "tun2socks")
+    tun_log = str(LOG_FILE).replace("xray.log", "tun2socks.log")
 
     proc = subprocess.Popen(
-        ["sudo", tun2socks_bin,
+        ["sudo", tun_bin,
          "-tun", TUN_DEV,
          "-proxy", f"socks5://127.0.0.1:{SOCKS_PORT}",
          "-tun-dns", "8.8.8.8",
@@ -201,41 +218,36 @@ def start_tun():
          "-tun-gw", TUN_GW,
          "-tun-mask", TUN_MASK,
          "-loglevel", "error"],
-        stdout=open(str(LOG_FILE).replace("xray", "tun2socks"), "w"),
-        stderr=subprocess.STDOUT
-    )
+        stdout=open(tun_log, "w"), stderr=subprocess.STDOUT)
     TUN_PID_FILE.write_text(str(proc.pid))
     time.sleep(2)
+
     if proc.poll() is None:
-        log(f"[OK] TUN mode active — all traffic through proxy!", G)
+        log("[OK] TUN mode active — ALL traffic through VMess!", G)
+        return True
     else:
-        log("[!] TUN mode failed — falling back to proxy-only mode", Y)
-        log("    Use: export ALL_PROXY=socks5://127.0.0.1:10808", Y)
+        log("[!] TUN failed — falling back to proxy-only", Y)
         restore_route()
+        return False
 
 def restore_route():
-    """Restore original routing"""
-    # Remove TUN routes
-    subprocess.run(["sudo", "ip", "route", "del", "0.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV], capture_output=True)
-    subprocess.run(["sudo", "ip", "route", "del", "128.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV], capture_output=True)
+    run(["sudo", "ip", "route", "del", "0.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV])
+    run(["sudo", "ip", "route", "del", "128.0.0.0/1", "via", TUN_GW, "dev", TUN_DEV])
 
-    # Remove server route
     if CONFIG.exists():
         try:
             cfg = json.loads(CONFIG.read_text())
             server_addr = cfg["outbounds"][0]["settings"]["vnext"][0]["address"]
-            subprocess.run(["sudo", "ip", "route", "del", f"{server_addr}/32"], capture_output=True)
+            run(["sudo", "ip", "route", "del", f"{server_addr}/32"])
         except: pass
 
-    # Remove TUN device
-    subprocess.run(["sudo", "ip", "tuntap", "del", "mode", "tun", "name", TUN_DEV], capture_output=True)
+    run(["sudo", "ip", "tuntap", "del", "mode", "tun", "name", TUN_DEV])
 
-    # Restore original default route if saved
     orig = DIR / "orig_route"
     if orig.exists():
         gw, dev = orig.read_text().strip().split()
-        subprocess.run(["sudo", "ip", "route", "add", "default", "via", gw, "dev", dev], capture_output=True)
-        log(f"[OK] Restored default route: {gw} via {dev}", G)
+        run(["sudo", "ip", "route", "add", "default", "via", gw, "dev", dev])
+        log(f"[OK] Restored route: {gw} via {dev}", G)
         orig.unlink(missing_ok=True)
 
 def connect(tun_mode=True):
@@ -244,46 +256,51 @@ def connect(tun_mode=True):
         log("[X] No config. Run: vmess-connect <vmess-link>", R)
         return 1
 
-    log("[...] Starting Xray client...", Y)
+    log("[...] Starting Xray...", Y)
     proc = subprocess.Popen(
         ["xray", "run", "-c", str(CONFIG)],
-        stdout=open(str(LOG_FILE), "w"), stderr=subprocess.STDOUT
-    )
+        stdout=open(str(LOG_FILE), "w"), stderr=subprocess.STDOUT)
     PID_FILE.write_text(str(proc.pid))
     time.sleep(2)
 
     if proc.poll() is not None:
-        log("[X] Xray failed! Check log:", R)
+        log("[X] Xray failed!", R)
         print(LOG_FILE.read_text()[-500:] if LOG_FILE.exists() else "No log")
         return 1
 
-    log(f"[OK] Xray running! PID: {proc.pid}", G)
+    log(f"[OK] Xray running — PID: {proc.pid}", G)
     print(f"  SOCKS5:  127.0.0.1:{SOCKS_PORT}")
     print(f"  HTTP:    127.0.0.1:{HTTP_PORT}")
 
     if tun_mode:
         print()
-        log("[...] Starting TUN mode (like NetMod)...", Y)
-        start_tun()
-        print()
-        log("=== ALL internet traffic now goes through VMess ===", G)
-        print(f"  {C}Browser, apps, everything — automatic{N}")
-        print(f"  {Y}Disconnect: vmess-connect -k{N}")
+        log("[...] Starting TUN mode...", Y)
+        if start_tun():
+            print()
+            log("=== Semua traffic otomatis lewat VMess ===", G)
+            print(f"  {C}Browser, apt, curl, pip — semua{N}")
+        else:
+            print()
+            log("=== Proxy-only mode ===", Y)
+            print(f"  {C}export ALL_PROXY=socks5://127.0.0.1:{SOCKS_PORT}{N}")
+            print(f"  {C}export http_proxy=http://127.0.0.1:{HTTP_PORT}{N}")
+            print(f"  {C}export https_proxy=http://127.0.0.1:{HTTP_PORT}{N}")
     else:
         print(f"\n  {C}export ALL_PROXY=socks5://127.0.0.1:{SOCKS_PORT}{N}")
         print(f"  {C}export http_proxy=http://127.0.0.1:{HTTP_PORT}{N}")
-        print(f"\n  {Y}Disconnect: vmess-connect -k{N}")
+        print(f"  {C}export https_proxy=http://127.0.0.1:{HTTP_PORT}{N}")
+
+    print(f"\n  {Y}Disconnect: vmess-connect -k{N}")
 
 def kill(silent=False):
-    # Kill tun2socks and restore routes
+    # Kill tun2socks + restore routes
     if TUN_PID_FILE.exists():
         try:
             pid = int(TUN_PID_FILE.read_text())
             os.kill(pid, signal.SIGTERM)
-            subprocess.run(["sudo", "kill", str(pid)], capture_output=True)
+            run(["sudo", "kill", str(pid)])
         except: pass
         TUN_PID_FILE.unlink(missing_ok=True)
-
     restore_route()
 
     # Kill xray
@@ -296,7 +313,7 @@ def kill(silent=False):
             if not silent: log("[--] Not running", Y)
         PID_FILE.unlink(missing_ok=True)
     elif not silent:
-        subprocess.run(["pkill", "-f", f"xray run -c {DIR}"], capture_output=True)
+        run(["pkill", "-f", f"xray run -c {DIR}"])
         log("[OK] Killed", G)
 
 def status():
@@ -305,7 +322,7 @@ def status():
         try:
             pid = int(PID_FILE.read_text())
             os.kill(pid, 0)
-            log(f"[OK] Xray running — PID: {pid}", G)
+            log(f"[OK] Xray — PID: {pid}", G)
             print(f"  SOCKS5: 127.0.0.1:{SOCKS_PORT} | HTTP: 127.0.0.1:{HTTP_PORT}")
             connected = True
         except: PID_FILE.unlink(missing_ok=True)
@@ -314,16 +331,15 @@ def status():
         try:
             pid = int(TUN_PID_FILE.read_text())
             os.kill(pid, 0)
-            log(f"[OK] TUN mode active — PID: {pid}", G)
+            log(f"[OK] TUN mode — PID: {pid}", G)
             connected = True
         except: TUN_PID_FILE.unlink(missing_ok=True)
 
     if connected:
         try:
-            ip = subprocess.run(
-                ["curl", "-s", "--max-time", "5", "-x",
+            ip = run(["curl", "-s", "--max-time", "5", "-x",
                  f"socks5://127.0.0.1:{SOCKS_PORT}", "https://ifconfig.me"],
-                capture_output=True, text=True, timeout=6).stdout.strip()
+                timeout=6).stdout.strip()
             if ip: print(f"  Proxy IP: {B}{ip}{N}")
         except: pass
     else:
@@ -342,9 +358,8 @@ def test():
                         ("HTTP", f"http://127.0.0.1:{HTTP_PORT}")]:
         print(f"  {name}... ", end="", flush=True)
         try:
-            ip = subprocess.run(
-                ["curl", "-s", "--max-time", "10", "-x", proxy, "https://ifconfig.me"],
-                capture_output=True, text=True, timeout=12).stdout.strip()
+            ip = run(["curl", "-s", "--max-time", "10", "-x", proxy,
+                "https://ifconfig.me"], timeout=12).stdout.strip()
             print(f"{G}OK IP: {ip}{N}" if ip else f"{R}FAIL{N}")
         except: print(f"{R}FAIL{N}")
 
@@ -363,71 +378,47 @@ def usage():
   {B}VMess Connect{N} — Kali Linux (NetMod style)
 {C}===================================={N}
 
-  {G}Usage:{N}
-  vmess-connect <vmess://...>     Connect (TUN mode — all traffic)
-  vmess-connect -P <vmess://...>  Connect (proxy-only, no TUN)
-  vmess-connect -f <file>         Connect from file
+  vmess-connect <vmess://...>     Connect (TUN mode)
+  vmess-connect -P <vmess://...>  Proxy-only (no TUN)
+  vmess-connect -f <file>         From file
+  vmess-connect -p <name>         Saved profile
   vmess-connect -s                Status
   vmess-connect -k                Disconnect
   vmess-connect -t                Test
-  vmess-connect -i                Install deps (xray + tun2socks)
+  vmess-connect -i                Install deps
   vmess-connect -l                List profiles
-  vmess-connect -p <name>         Use saved profile
 
-  {Y}TUN mode (default):{N}
-  Semua traffic otomatis lewat VMess — kayak NetMod
-  Browser, apt, pip, curl — semua tanpa export
-
-  {C}Proxy-only mode (-P):{N}
-  Hanya SOCKS5:10808 + HTTP:10809
-  Perlu export: ALL_PROXY=socks5://127.0.0.1:10808
+  {Y}TUN mode (default):{N} Semua traffic otomatis lewat VMess
+  {C}Proxy-only (-P):{N}    Hanya SOCKS5 + HTTP proxy
 """)
 
 def main():
     setup()
     args = sys.argv[1:]
 
-    if not args or args[0] in ("-h", "--help"):
-        usage()
-    elif args[0] == "-i":
-        install_deps()
-    elif args[0] == "-s":
-        status()
-    elif args[0] == "-k":
-        kill()
-    elif args[0] == "-t":
-        test()
-    elif args[0] == "-l":
-        list_profiles()
+    if not args or args[0] in ("-h", "--help"): usage()
+    elif args[0] == "-i": install_deps()
+    elif args[0] == "-s": status()
+    elif args[0] == "-k": kill()
+    elif args[0] == "-t": test()
+    elif args[0] == "-l": list_profiles()
     elif args[0] == "-p" and len(args) > 1:
         f = PROFILES / f"{args[1]}.vmess"
-        if not f.exists():
-            log(f"[X] Not found: {args[1]}", R); list_profiles(); sys.exit(1)
-        link = f.read_text().strip()
-        data = decode_vmess(link)
-        generate_config(data)
-        connect(tun_mode=True)
+        if not f.exists(): log(f"[X] Not found: {args[1]}", R); list_profiles(); sys.exit(1)
+        data = decode_vmess(f.read_text().strip())
+        generate_config(data); connect(tun_mode=True)
     elif args[0] == "-f" and len(args) > 1:
         content = pathlib.Path(args[1]).read_text()
         link = re.search(r'vmess://[A-Za-z0-9+/=]+', content)
         if not link: log("[X] No vmess:// link in file", R); sys.exit(1)
         data = decode_vmess(link.group())
-        generate_config(data)
-        save_profile(link.group(), data)
-        connect(tun_mode=True)
+        generate_config(data); save_profile(link.group(), data); connect(tun_mode=True)
     elif args[0] == "-P" and len(args) > 1:
-        # Proxy-only mode (no TUN)
         data = decode_vmess(args[1])
-        generate_config(data)
-        save_profile(args[1], data)
-        connect(tun_mode=False)
+        generate_config(data); save_profile(args[1], data); connect(tun_mode=False)
     elif args[0].startswith("vmess://"):
         data = decode_vmess(args[0])
-        generate_config(data)
-        save_profile(args[0], data)
-        connect(tun_mode=True)
-    else:
-        log(f"[X] Unknown: {args[0]}", R); usage(); sys.exit(1)
+        generate_config(data); save_profile(args[0], data); connect(tun_mode=True)
+    else: log(f"[X] Unknown: {args[0]}", R); usage(); sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
